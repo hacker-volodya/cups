@@ -1,0 +1,15 @@
+services:
+  cups-lbp810:
+    image: ghcr.io/akiba-hs/cups
+    build: .
+    restart: always
+    ports:
+      - "631:631"
+    devices:
+      - "/dev/usb/lp0:/dev/usb/lp0"
+    volumes:
+      - "./config:/etc/cups"
+    environment:
+      - TZ=Asia/Tomsk
+      - CUPSADMIN=akiba
+      - CUPSPASSWORD=akiba1337
