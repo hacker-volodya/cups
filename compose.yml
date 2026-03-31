@@ -6,7 +6,7 @@ services:
     ports:
       - "631:631"
     devices:
-      - "/dev/usb/lp0:/dev/usb/lp0"
+      - "/dev/usb/lp1:/dev/usb/lp0"
     volumes:
       - "./config:/etc/cups"
     environment:
