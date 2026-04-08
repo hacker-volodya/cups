@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+CUPS filter for Xprinter thermal label printers.
+
+Converts PDF input to TSPL/TSPL2 bitmap commands.
+
+Called by CUPS as:
+    xprinter-tspl job-id user title copies options [filename]
+
+Reads PDF from filename (or stdin), outputs TSPL to stdout.
+"""
+
+import sys
+import os
+import signal
+import tempfile
+
+# CUPS filter exit codes
+CUPS_BACKEND_OK = 0
+CUPS_BACKEND_FAILED = 1
+CUPS_BACKEND_RETRY = 6
+
+# Ignore SIGPIPE so we get BrokenPipeError instead of a silent kill
+signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+# Default margin in mm (0 = full bleed, pdftopdf already handles page fitting)
+MARGIN_MM = 0
+
+
+def mm_to_dots(mm, dpi=203):
+    return int(mm * dpi / 25.4)
+
+
+def pts_to_mm(pts):
+    return pts * 25.4 / 72.0
+
+
+def log(msg):
+    sys.stderr.write(f"ERROR: [xprinter-tspl] {msg}\n")
+    sys.stderr.flush()
+
+
+def info(msg):
+    sys.stderr.write(f"INFO: [xprinter-tspl] {msg}\n")
+    sys.stderr.flush()
+
+
+def parse_options(options_str):
+    opts = {}
+    for item in options_str.split():
+        if "=" in item:
+            k, v = item.split("=", 1)
+            opts[k] = v
+        else:
+            opts[item] = "true"
+    return opts
+
+
+def get_page_size_mm(opts):
+    page_size = opts.get("PageSize", "w164h113")
+    if page_size.startswith("w") and "h" in page_size:
+        parts = page_size[1:].split("h")
+        try:
+            return pts_to_mm(float(parts[0])), pts_to_mm(float(parts[1]))
+        except (ValueError, IndexError):
+            pass
+    return 58.0, 40.0
+
+
+def grayscale_to_tspl_bitmap(gray_image):
+    """
+    Convert a grayscale PIL Image to TSPL bitmap bytes.
+
+    Uses Pillow-only bit packing (no numpy needed).
+    TSPL BITMAP mode 0: 0=black dot, 1=white (no dot).
+    """
+    w, h = gray_image.size
+    width_bytes = (w + 7) // 8
+
+    # Threshold: pixel < 128 → black (print dot) → bit 0
+    #            pixel >= 128 → white (no dot)    → bit 1
+    bw = gray_image.point(lambda x: 0 if x < 128 else 255, "1")
+
+    # Pillow mode '1' tobytes() returns packed bits, MSB first
+    # In Pillow: bit 0 = black, bit 1 = white — matches TSPL convention
+    packed = bw.tobytes()
+
+    # Pillow packs rows to byte boundaries, row stride = ceil(w/8)
+    pillow_stride = (w + 7) // 8
+    if pillow_stride == width_bytes and len(packed) == width_bytes * h:
+        return width_bytes, packed
+
+    # Re-stride if needed
+    result = bytearray(width_bytes * h)
+    for row in range(h):
+        src_off = row * pillow_stride
+        dst_off = row * width_bytes
+        copy_len = min(pillow_stride, width_bytes)
+        result[dst_off:dst_off + copy_len] = packed[src_off:src_off + copy_len]
+    return width_bytes, bytes(result)
+
+
+def pdf_to_tspl(pdf_path, copies, options):
+    try:
+        import fitz
+    except ImportError:
+        log("PyMuPDF (fitz) not installed")
+        return CUPS_BACKEND_FAILED
+
+    try:
+        from PIL import Image
+    except ImportError:
+        log("Pillow not installed")
+        return CUPS_BACKEND_FAILED
+
+    opts = parse_options(options)
+
+    width_mm, height_mm = get_page_size_mm(opts)
+    info(f"Label size: {width_mm:.1f} x {height_mm:.1f} mm")
+
+    density = int(opts.get("XprinterDensity", "8"))
+    speed = int(opts.get("XprinterSpeed", "3"))
+    gap_mm = int(opts.get("XprinterGap", "2"))
+    dpi = 203
+    target_w = mm_to_dots(width_mm, dpi)
+    target_h = mm_to_dots(height_mm, dpi)
+
+    info(f"Target: {target_w}x{target_h} dots, density={density}, speed={speed}")
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        log(f"Failed to open PDF: {e}")
+        return CUPS_BACKEND_FAILED
+
+    stdout_bin = os.fdopen(sys.stdout.fileno(), "wb", closefd=False)
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        info(f"Processing page {page_num + 1}/{len(doc)}")
+
+        # Render page and scale to fit label, preserving aspect ratio
+        page_rect = page.rect
+        info(f"PDF page: {page_rect.width:.1f}x{page_rect.height:.1f} pts")
+
+        # Render at high enough resolution then scale down
+        zoom = dpi / 72.0
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+        # Small margin to prevent clipping at edges (dots)
+        margin = mm_to_dots(1, dpi)
+        print_w = target_w - 2 * margin
+        print_h = target_h - 2 * margin
+
+        # Scale to fit printable area, maintaining aspect ratio
+        scale = min(print_w / img.width, print_h / img.height)
+        new_w = int(img.width * scale)
+        new_h = int(img.height * scale)
+        if scale != 1.0:
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+
+        # Place on white canvas with margin, center horizontally
+        canvas = Image.new("L", (target_w, target_h), 255)
+        x_off = margin + (print_w - new_w) // 2
+        y_off = margin
+        canvas.paste(img.convert("L"), (x_off, y_off))
+
+        # Convert to TSPL bitmap
+        width_bytes, bitmap_data = grayscale_to_tspl_bitmap(canvas)
+
+        # Build TSPL commands
+        tspl = b""
+        tspl += f"SIZE {width_mm:.1f} mm, {height_mm:.1f} mm\r\n".encode()
+        tspl += f"GAP {gap_mm} mm, 0 mm\r\n".encode()
+        tspl += b"DIRECTION 0,0\r\n"
+        tspl += f"DENSITY {density}\r\n".encode()
+        tspl += f"SPEED {speed}\r\n".encode()
+        tspl += b"CLS\r\n"
+        tspl += f"BITMAP 0,0,{width_bytes},{target_h},0,".encode()
+        tspl += bitmap_data
+        tspl += f"\r\nPRINT {copies},1\r\n".encode()
+
+        try:
+            stdout_bin.write(tspl)
+            stdout_bin.flush()
+        except BrokenPipeError:
+            log("BrokenPipeError: printer connection lost")
+            doc.close()
+            return CUPS_BACKEND_RETRY
+
+    doc.close()
+    info("Done")
+    return CUPS_BACKEND_OK
+
+
+def main():
+    if len(sys.argv) < 6 or len(sys.argv) > 7:
+        sys.stderr.write(
+            "Usage: xprinter-tspl job-id user title copies options [filename]\n"
+        )
+        return CUPS_BACKEND_FAILED
+
+    job_id = sys.argv[1]
+    user = sys.argv[2]
+    title = sys.argv[3]
+    copies = int(sys.argv[4])
+    options = sys.argv[5]
+    filename = sys.argv[6] if len(sys.argv) == 7 else None
+
+    info(f"Job {job_id}: '{title}' by {user}, {copies} copies")
+
+    if filename:
+        pdf_path = filename
+    else:
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        try:
+            stdin_bin = os.fdopen(sys.stdin.fileno(), "rb", closefd=False)
+            while True:
+                chunk = stdin_bin.read(65536)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+            tmp.close()
+            pdf_path = tmp.name
+        except Exception as e:
+            log(f"Failed to read stdin: {e}")
+            return CUPS_BACKEND_FAILED
+
+    try:
+        result = pdf_to_tspl(pdf_path, copies, options)
+    finally:
+        if not filename and os.path.exists(pdf_path):
+            os.unlink(pdf_path)
+
+    return result
+
+
+if __name__ == "__main__":
+    sys.exit(main())
