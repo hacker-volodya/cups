@@ -26,12 +26,14 @@ Install avahi:
 apt install avahi-daemon
 ```
 
-To enable printer discovery for both queues at once, add `/etc/avahi/services/cups-printers.service`:
+To enable printer discovery on the network, add files: 
+
+`/etc/avahi/services/cups-lbp810.service`:
 ```xml
 <?xml version="1.0" standalone='no'?>
 <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
 <service-group>
-  <name replace-wildcards="yes">CUPS Printers on %h</name>
+  <name replace-wildcards="yes">Canon LBP-810 on %h</name>
 
   <service>
     <type>_ipp._tcp</type>
@@ -50,18 +52,24 @@ To enable printer discovery for both queues at once, add `/etc/avahi/services/cu
     <txt-record>Color=F</txt-record>
     <txt-record>Duplex=F</txt-record>
   </service>
+</service-group>
+```
 
+`/etc/avahi/services/cups-xprinter.service`
+```xml
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">XPrinter TDP245 on %h</name>
   <service>
     <type>_ipp._tcp</type>
     <subtype>_universal._sub._ipp._tcp</subtype>
     <port>631</port>
-
     <txt-record>txtvers=1</txt-record>
     <txt-record>qtotal=1</txt-record>
     <txt-record>rp=printers/XPrinter-TDP245</txt-record>
     <txt-record>ty=XPrinter TDP-245 compatible</txt-record>
     <txt-record>product=(TSPL printer via CUPS)</txt-record>
-    <txt-record>note=AirPrint via CUPS</txt-record>
     <txt-record>adminurl=http://%h:631/printers/XPrinter-TDP245</txt-record>
     <txt-record>URF=none</txt-record>
     <txt-record>pdl=application/pdf,application/postscript,image/urf</txt-record>
